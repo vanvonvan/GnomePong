@@ -81,7 +81,14 @@ export class PongOverlay {
         this._buildMenus();
 
         this._grab = Main.pushModal(this._container, { actionMode: Shell.ActionMode.NORMAL });
-        if (!this._grab || this._grab.get_seat_state() === Clutter.GrabState.NONE) {
+        // On GNOME 50 the object returned by pushModal does not expose
+        // get_seat_state(), so only consult it when it actually exists;
+        // otherwise a non-null grab is treated as success (matches the
+        // sibling GnomeOver/GnomeClimber extensions on this same shell).
+        const grabFailed = !this._grab ||
+            (typeof this._grab.get_seat_state === 'function' &&
+             this._grab.get_seat_state() === Clutter.GrabState.NONE);
+        if (grabFailed) {
             if (this._grab)
                 Main.popModal(this._grab);
             this._grab = null;
