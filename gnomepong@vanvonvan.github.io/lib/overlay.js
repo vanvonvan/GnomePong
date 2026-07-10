@@ -33,8 +33,9 @@ export class PongOverlay {
         this._net = null;           // HostGame | ClientGame while networking
         this._netRole = null;       // 'host' | 'client'
         this._keys = new Set();
-        this._pointerX = 0;
-        this._pointerY = 0;
+        this._pointerY = 0;         // last pointer stage-y, mapped by _mouseVirtualY
+        this._prevPointerY = null;  // previous poll's stage-y, for motion detection
+        this._lastInput = null;     // 'mouse' | 'key' — which drives the 1P paddle
         this._btnDown = false;      // last-frame primary-button state (edge detect)
         this._lastTime = 0;
         this._cursorHidden = false;
@@ -158,20 +159,12 @@ export class PongOverlay {
 
         this._container.add_child(this._buildJoinForm());
 
-        this._hint = new St.Label({
-            style_class: 'gnomepong-hint',
-            x_align: Clutter.ActorAlign.CENTER,
-            y_align: Clutter.ActorAlign.END,
-        });
-        this._hint.set_style('padding-bottom: 24px;');
-        this._container.add_child(this._hint);
-
-        // Keyboard is delivered to the key-focused actor under the modal grab,
-        // so the key signals are reliable. Clutter pointer events (motion /
-        // button) are NOT delivered to the overlay under pushModal on this
-        // shell, so all pointer input is polled from global.get_pointer() in
-        // _tick() instead (see _pollPointer). This mirrors the sibling
-        // GnomeOver extension, which hit the same wall on GNOME 50.
+        // Keyboard IS delivered to the key-focused actor under the modal grab,
+        // so key signals are reliable. Clutter pointer events (motion / button)
+        // are NOT reliably delivered under pushModal on this shell, so all
+        // pointer input is polled from global.get_pointer() in _tick() (see
+        // _pollPointer). This mirrors the sibling GnomeShot aim-trainer, whose
+        // whole game is mouse-driven and uses exactly this poll under the grab.
         this._container.connect('key-press-event', (_a, ev) => this._onKeyPress(ev));
         this._container.connect('key-release-event', (_a, ev) => this._onKeyRelease(ev));
 
@@ -187,6 +180,10 @@ export class PongOverlay {
             { label: 'Host game', action: () => this._startHost() },
             { label: 'Join game', action: () => this._showJoin() },
             { label: 'Quit', action: () => this.close() },
+        ], [
+            '1 Player:  move the mouse  ·  or  W / S',
+            '2 Players:  W / S   vs   ↑ / ↓',
+            'Space serves early  ·  P or Esc for the menu',
         ]);
         this._pauseMenu = new Menu('Paused', [
             { label: 'Resume', action: () => this._resume() },
@@ -278,6 +275,9 @@ export class PongOverlay {
         this._hideJoin();
         this._engine.start(mode, this._settings.get_int(C.Keys.WIN_SCORE));
         this._ai = mode === C.Mode.ONE_PLAYER ? new AIController(C.Side.RIGHT) : null;
+        this._keys.clear();
+        this._lastInput = null;     // paddle holds center until mouse/keys move it
+        this._prevPointerY = null;
         this._menu = null;
         this._info = null;
         this._syncHint();
@@ -454,18 +454,11 @@ export class PongOverlay {
         ]);
     }
 
+    // Formerly updated an on-screen hint label; now just requests a repaint.
+    // There is intentionally NO text drawn over the playfield during a match —
+    // the controls legend lives on the main menu (see _buildMenus). Kept under
+    // the old name because it's called from every state transition.
     _syncHint() {
-        let hint = '';
-        if (!this._menu && !this._info && !this._net && !this._joinVisible()) {
-            const s = this._engine.state;
-            if (s === C.State.SERVING)
-                hint = 'Space to serve  ·  P or Esc for menu';
-            else if (this._engine.mode === C.Mode.ONE_PLAYER)
-                hint = 'Mouse to move  ·  P or Esc for menu';
-            else
-                hint = 'W/S  vs  ↑/↓  ·  P or Esc for menu';
-        }
-        this._hint.text = hint;
         this._queueRepaint();
     }
 
@@ -526,7 +519,13 @@ export class PongOverlay {
     }
 
     _mouseVirtualY() {
-        const vp = this._viewport();
+        // Map against the monitor's LOGICAL size, not the drawing area's
+        // surface size. global.get_pointer() returns logical stage coords, and
+        // the area fills the monitor-sized container, so this is the matching
+        // space; it also avoids the surface being transiently 0-sized (which
+        // used to make vp.scale 0 and pin the paddle to dead center on every
+        // key release) and stays correct under fractional display scaling.
+        const vp = Render.viewport(this._monitor.width, this._monitor.height);
         const localY = this._pointerY - this._monitor.y;
         return vp.scale > 0 ? (localY - vp.offY) / vp.scale : C.VIRT_H / 2;
     }
@@ -534,7 +533,22 @@ export class PongOverlay {
     _applyInput(dt) {
         const e = this._engine;
         if (e.mode === C.Mode.ONE_PLAYER) {
-            e.setPaddleCenter(C.Side.LEFT, this._mouseVirtualY());
+            // The lone human drives the left paddle with EITHER the mouse or the
+            // keyboard; whichever was used most recently wins (_lastInput, set
+            // by _onKeyPress and by motion detected in _pollPointer). While a
+            // W/S/↑/↓ key is held the paddle moves; on release it HOLDS its
+            // position (it no longer snaps back to the mouse/center). Moving the
+            // mouse hands control back to the mouse.
+            const up = this._keys.has('lup') || this._keys.has('rup');
+            const down = this._keys.has('ldown') || this._keys.has('rdown');
+            if (up || down) {
+                if (up)
+                    e.movePaddleBy(C.Side.LEFT, -C.PADDLE_SPEED * dt);
+                if (down)
+                    e.movePaddleBy(C.Side.LEFT, C.PADDLE_SPEED * dt);
+            } else if (this._lastInput === 'mouse') {
+                e.setPaddleCenter(C.Side.LEFT, this._mouseVirtualY());
+            }
         } else if (e.mode === C.Mode.TWO_PLAYER) {
             if (this._keys.has('lup'))
                 e.movePaddleBy(C.Side.LEFT, -C.PADDLE_SPEED * dt);
@@ -575,11 +589,6 @@ export class PongOverlay {
 
     // ---- Rendering -------------------------------------------------------
 
-    _viewport() {
-        const [w, h] = this._area.get_surface_size();
-        return Render.viewport(w, h);
-    }
-
     _repaint() {
         const cr = this._area.get_context();
         const [w, h] = this._area.get_surface_size();
@@ -600,23 +609,31 @@ export class PongOverlay {
     // ---- Input handlers --------------------------------------------------
 
     // Poll the pointer once per frame. Under the modal grab Clutter does not
-    // deliver motion/button events to the overlay, so this drives everything
-    // pointer-related: the mouse-controlled paddle (via _pointerY, read by
-    // _mouseVirtualY), menu hover highlighting, and menu clicks (rising edge
-    // of the primary button). global.get_pointer() returns stage coords + a
-    // modifier mask that carries the button state.
+    // reliably deliver motion/button events to the overlay, so this drives
+    // everything pointer-related: the mouse-controlled paddle (via _pointerY,
+    // read by _mouseVirtualY), menu hover highlighting, and menu clicks (rising
+    // edge of the primary button). global.get_pointer() returns stage coords
+    // plus a modifier mask carrying the button state. This is the exact pattern
+    // the GnomeShot sibling uses to run an entirely mouse-driven game.
     _pollPointer() {
         if (!this._area)
             return;
         const [px, py, mods] = global.get_pointer();
-        this._pointerX = px; // stage x
+        // A real change in pointer position means the human is using the mouse;
+        // hand paddle control to it (see _applyInput). Actual motion only — so a
+        // motionless mouse never overrides the keyboard.
+        if (this._prevPointerY !== null && Math.abs(py - this._prevPointerY) > 0.5)
+            this._lastInput = 'mouse';
+        this._prevPointerY = py;
         this._pointerY = py; // stage y, mapped to virtual in _mouseVirtualY
         const localX = px - this._monitor.x;
         const localY = py - this._monitor.y;
 
-        // Hover-highlight the menu item under the pointer.
+        // Hover-highlight the menu item under the pointer. Hit-test in the same
+        // logical monitor space the pointer coords live in (see _mouseVirtualY).
         if (this._menu && !this._info) {
-            const [w, h] = this._area.get_surface_size();
+            const w = this._monitor.width;
+            const h = this._monitor.height;
             const i = Render.menuHit(w, h, this._menu, localX, localY);
             if (i >= 0 && i !== this._menu.selected) {
                 this._menu.select(i);
@@ -634,8 +651,8 @@ export class PongOverlay {
     _onPointerClick(localX, localY) {
         if (!this._menu || this._info)
             return;
-        const [w, h] = this._area.get_surface_size();
-        const i = Render.menuHit(w, h, this._menu, localX, localY);
+        const i = Render.menuHit(this._monitor.width, this._monitor.height,
+            this._menu, localX, localY);
         if (i >= 0) {
             this._menu.select(i);
             this._menu.activate();
@@ -736,6 +753,7 @@ export class PongOverlay {
         const token = this._keyToken(sym);
         if (token) {
             this._keys.add(token);
+            this._lastInput = 'key'; // keyboard now owns the 1P paddle
             return Clutter.EVENT_STOP;
         }
         const e = this._engine;

@@ -54,12 +54,15 @@ pack: schemas
 		--extra-source=icons \
 		$(EXT_SRC)
 
-# Launch a visible, isolated nested GNOME Shell with the extension enabled.
-# This is the way to play-test on Wayland without logging out.
+# Launch a nested GNOME Shell with the extension enabled (isolated config).
+# NOTE: on this NVIDIA box a plain `--wayland` shell dies with EBUSY, so this
+# rarely opens a visible window here — prefer `make devkit` below.
 nested: link
 	bash tools/run-nested.sh
 
-# GNOME's development kit (a clean nested shell; note it disables user
-# extensions, so it is NOT for testing GnomePong — kept for reference).
-devkit:
-	dbus-run-session -- gnome-shell --devkit
+# Launch a VISIBLE, isolated nested GNOME Shell via the devkit backend with
+# GnomePong enabled. This is the ONE way that actually renders + accepts input
+# on this box (the devkit's mutter-devkit backend works where `--wayland` hits
+# EBUSY). This is the way to play-test on Wayland without logging out.
+devkit: link
+	bash tools/run-devkit.sh

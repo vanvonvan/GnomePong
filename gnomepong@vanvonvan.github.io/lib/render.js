@@ -196,7 +196,21 @@ export function menuLayout(w, h, menu) {
     const itemH = 58 * scale;
     const gap = 16 * scale;
     const n = menu.items.length;
-    const startY = menu.heading ? h * 0.44 : h * 0.46;
+    const footerLines = menu.footer ? menu.footer.length : 0;
+    const footerLead = 34 * scale;  // gap from the last item to the first footer line
+    const footerStep = 30 * scale;  // line-to-line footer spacing
+
+    let startY = menu.heading ? h * 0.44 : h * 0.46;
+    if (footerLines) {
+        // Center the items+footer as one block in the area below the title, so
+        // the extra lines never push the last items off the bottom edge.
+        const itemsH = n * itemH + (n - 1) * gap;
+        const footerH = footerLead + footerLines * footerStep;
+        const top = h * 0.30;
+        const region = h * 0.95 - top;
+        startY = top + Math.max(0, (region - (itemsH + footerH)) / 2);
+    }
+
     const items = [];
     for (let i = 0; i < n; i++) {
         items.push({
@@ -212,6 +226,9 @@ export function menuLayout(w, h, menu) {
         headingY: h * 0.30,
         headingSize: 48 * scale,
         itemFont: 26 * scale,
+        footerStart: startY + n * itemH + (n - 1) * gap + footerLead,
+        footerStep,
+        footerSize: 18 * scale,
     };
 }
 
@@ -274,4 +291,15 @@ export function drawMenu(cr, w, h, menu, colors, opts = {}) {
             centerText(cr, item.label, L.itemFont, cx, cy, colors.score);
         }
     });
+
+    // Optional footer lines (e.g. the controls legend on the main menu), drawn
+    // below the items in the dim net color. This is the ONLY place the controls
+    // are shown — there is no on-screen hint during play.
+    if (menu.footer && menu.footer.length) {
+        let fy = L.footerStart;
+        for (const line of menu.footer) {
+            centerText(cr, line, L.footerSize, w / 2, fy, colors.net);
+            fy += L.footerStep;
+        }
+    }
 }
