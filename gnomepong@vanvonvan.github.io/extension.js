@@ -1,6 +1,7 @@
 // GnomePong — top-bar button that launches the full-screen Pong overlay.
 
 import Clutter from 'gi://Clutter';
+import Gio from 'gi://Gio';
 import GObject from 'gi://GObject';
 import St from 'gi://St';
 
@@ -12,12 +13,12 @@ import { PongOverlay } from './lib/overlay.js';
 
 const PongButton = GObject.registerClass(
 class PongButton extends PanelMenu.Button {
-    _init(onActivate) {
+    _init(onActivate, iconPath) {
         super._init(0.0, 'GnomePong', true);
         this._onActivate = onActivate;
-        this.add_child(new St.Label({
-            text: 'PONG',
-            style_class: 'gnomepong-panel-icon',
+        this.add_child(new St.Icon({
+            gicon: Gio.icon_new_for_string(iconPath),
+            style_class: 'system-status-icon',
             y_align: Clutter.ActorAlign.CENTER,
         }));
     }
@@ -36,7 +37,9 @@ class PongButton extends PanelMenu.Button {
 export default class GnomePongExtension extends Extension {
     enable() {
         this._overlay = new PongOverlay(this);
-        this._button = new PongButton(() => this._overlay.open());
+        this._button = new PongButton(
+            () => this._overlay.open(),
+            `${this.path}/icons/gnomepong-symbolic.svg`);
         Main.panel.addToStatusArea('gnomepong', this._button);
     }
 

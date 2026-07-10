@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- Pong: two paddles, a center net, and the ball. Symbolic: fill follows
+       the panel foreground color (currentColor) so it adapts to the theme. -->
+  <g fill="currentColor">
+    <rect x="1"    y="4"   width="1.6" height="8" rx="0.6"/>
+    <rect x="13.4" y="4"   width="1.6" height="8" rx="0.6"/>
+    <rect x="7.5"  y="2"   width="1"   height="2"/>
+    <rect x="7.5"  y="5"   width="1"   height="2"/>
+    <rect x="7.5"  y="8"   width="1"   height="2"/>
+    <rect x="7.5"  y="11"  width="1"   height="2"/>
+    <circle cx="5.2" cy="9.5" r="1.4"/>
+  </g>
+</svg>

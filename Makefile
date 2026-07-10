@@ -39,7 +39,8 @@ link: schemas
 install: schemas
 	mkdir -p $(EXT_DIR)
 	cp -r $(EXT_SRC)/metadata.json $(EXT_SRC)/extension.js $(EXT_SRC)/prefs.js \
-		$(EXT_SRC)/stylesheet.css $(EXT_SRC)/lib $(EXT_SRC)/sounds $(EXT_SRC)/schemas $(EXT_DIR)/
+		$(EXT_SRC)/stylesheet.css $(EXT_SRC)/lib $(EXT_SRC)/sounds $(EXT_SRC)/schemas \
+		$(EXT_SRC)/icons $(EXT_DIR)/
 	@echo "Installed to $(EXT_DIR)"
 
 uninstall:
@@ -50,6 +51,7 @@ pack: schemas
 	gnome-extensions pack --force \
 		--extra-source=lib \
 		--extra-source=sounds \
+		--extra-source=icons \
 		$(EXT_SRC)
 
 # Launch a visible, isolated nested GNOME Shell with the extension enabled.
