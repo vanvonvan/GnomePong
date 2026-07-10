@@ -35,6 +35,7 @@ export class PongOverlay {
         this._keys = new Set();
         this._pointerY = 0;
         this._lastTime = 0;
+        this._cursorHidden = false;
         this._colors = this._readColors();
         this._colorsId = this._settings.connect('changed', () => {
             this._colors = this._readColors();
@@ -80,8 +81,9 @@ export class PongOverlay {
         this._buildMenus();
 
         this._grab = Main.pushModal(this._container, { actionMode: Shell.ActionMode.NORMAL });
-        if (this._grab.get_seat_state() === Clutter.GrabState.NONE) {
-            Main.popModal(this._grab);
+        if (!this._grab || this._grab.get_seat_state() === Clutter.GrabState.NONE) {
+            if (this._grab)
+                Main.popModal(this._grab);
             this._grab = null;
             this.close();
             Main.notify('GnomePong', 'Could not grab input (is another modal open?).');
@@ -159,6 +161,10 @@ export class PongOverlay {
         this._container.connect('key-release-event', (_a, ev) => this._onKeyRelease(ev));
         this._container.connect('motion-event', (_a, ev) => this._onMotion(ev));
         this._container.connect('button-press-event', (_a, ev) => this._onButtonPress(ev));
+
+        // The overlay must be on the stage before pushModal can grab it (a modal
+        // grab attaches to an on-stage actor). uiGroup stacks it above the rest.
+        Main.layoutManager.uiGroup.add_child(this._container);
     }
 
     _buildMenus() {
@@ -540,9 +546,15 @@ export class PongOverlay {
     _setCursorHidden(hidden) {
         if (hidden === this._cursorHidden)
             return;
+        // GNOME 49+ dropped set_pointer_visible(); use the balanced inhibit API.
+        // The state guard above keeps inhibit/uninhibit calls paired.
         const tracker = this._cursorTracker();
-        if (tracker)
-            tracker.set_pointer_visible(!hidden);
+        if (tracker && tracker.inhibit_cursor_visibility) {
+            if (hidden)
+                tracker.inhibit_cursor_visibility();
+            else
+                tracker.uninhibit_cursor_visibility();
+        }
         this._cursorHidden = hidden;
     }
 
