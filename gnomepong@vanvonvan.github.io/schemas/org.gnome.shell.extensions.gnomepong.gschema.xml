@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.gnomepong"
+          path="/org/gnome/shell/extensions/gnomepong/">
+
+    <!-- Colors (hex #rrggbb) -->
+    <key name="color-background" type="s">
+      <default>'#000000'</default>
+      <summary>Background color</summary>
+    </key>
+    <key name="color-net" type="s">
+      <default>'#c8c8c8'</default>
+      <summary>Center net color</summary>
+    </key>
+    <key name="color-ball" type="s">
+      <default>'#ffffff'</default>
+      <summary>Ball color</summary>
+    </key>
+    <key name="color-paddle-left" type="s">
+      <default>'#ffffff'</default>
+      <summary>Left paddle color</summary>
+    </key>
+    <key name="color-paddle-right" type="s">
+      <default>'#ffffff'</default>
+      <summary>Right paddle color</summary>
+    </key>
+    <key name="color-score" type="s">
+      <default>'#ffffff'</default>
+      <summary>Score digits color</summary>
+    </key>
+
+    <!-- Rules -->
+    <key name="win-score" type="i">
+      <default>11</default>
+      <range min="1" max="99"/>
+      <summary>Points needed to win</summary>
+    </key>
+    <key name="sound-enabled" type="b">
+      <default>true</default>
+      <summary>Enable sound effects</summary>
+    </key>
+  </schema>
+</schemalist>
