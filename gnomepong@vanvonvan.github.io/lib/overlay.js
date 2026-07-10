@@ -33,7 +33,9 @@ export class PongOverlay {
         this._net = null;           // HostGame | ClientGame while networking
         this._netRole = null;       // 'host' | 'client'
         this._keys = new Set();
+        this._pointerX = 0;
         this._pointerY = 0;
+        this._btnDown = false;      // last-frame primary-button state (edge detect)
         this._lastTime = 0;
         this._cursorHidden = false;
         this._colors = this._readColors();
@@ -80,7 +82,7 @@ export class PongOverlay {
         this._buildUI();
         this._buildMenus();
 
-        this._grab = Main.pushModal(this._container, { actionMode: Shell.ActionMode.NORMAL });
+        this._grab = Main.pushModal(this._container, { actionMode: Shell.ActionMode.SYSTEM_MODAL });
         // On GNOME 50 the object returned by pushModal does not expose
         // get_seat_state(), so only consult it when it actually exists;
         // otherwise a non-null grab is treated as success (matches the
@@ -164,10 +166,14 @@ export class PongOverlay {
         this._hint.set_style('padding-bottom: 24px;');
         this._container.add_child(this._hint);
 
+        // Keyboard is delivered to the key-focused actor under the modal grab,
+        // so the key signals are reliable. Clutter pointer events (motion /
+        // button) are NOT delivered to the overlay under pushModal on this
+        // shell, so all pointer input is polled from global.get_pointer() in
+        // _tick() instead (see _pollPointer). This mirrors the sibling
+        // GnomeOver extension, which hit the same wall on GNOME 50.
         this._container.connect('key-press-event', (_a, ev) => this._onKeyPress(ev));
         this._container.connect('key-release-event', (_a, ev) => this._onKeyRelease(ev));
-        this._container.connect('motion-event', (_a, ev) => this._onMotion(ev));
-        this._container.connect('button-press-event', (_a, ev) => this._onButtonPress(ev));
 
         // The overlay must be on the stage before pushModal can grab it (a modal
         // grab attaches to an on-stage actor). uiGroup stacks it above the rest.
@@ -472,6 +478,8 @@ export class PongOverlay {
         if (dt > MAX_DT)
             dt = MAX_DT;
 
+        this._pollPointer();
+
         if (this._net) {
             if (!this._menu && !this._info)
                 this._net.setLocalPaddle(this._mouseVirtualY());
@@ -591,36 +599,47 @@ export class PongOverlay {
 
     // ---- Input handlers --------------------------------------------------
 
-    _localCoords(ev) {
-        const [x, y] = ev.get_coords();
-        return [x - this._monitor.x, y - this._monitor.y];
-    }
+    // Poll the pointer once per frame. Under the modal grab Clutter does not
+    // deliver motion/button events to the overlay, so this drives everything
+    // pointer-related: the mouse-controlled paddle (via _pointerY, read by
+    // _mouseVirtualY), menu hover highlighting, and menu clicks (rising edge
+    // of the primary button). global.get_pointer() returns stage coords + a
+    // modifier mask that carries the button state.
+    _pollPointer() {
+        if (!this._area)
+            return;
+        const [px, py, mods] = global.get_pointer();
+        this._pointerX = px; // stage x
+        this._pointerY = py; // stage y, mapped to virtual in _mouseVirtualY
+        const localX = px - this._monitor.x;
+        const localY = py - this._monitor.y;
 
-    _onMotion(ev) {
-        const [x, y] = this._localCoords(ev); // widget-local, for menu hit-test
-        this._pointerY = ev.get_coords()[1];  // stage y, mapped in _applyInput
+        // Hover-highlight the menu item under the pointer.
         if (this._menu && !this._info) {
             const [w, h] = this._area.get_surface_size();
-            const i = Render.menuHit(w, h, this._menu, x, y);
-            if (i >= 0) {
+            const i = Render.menuHit(w, h, this._menu, localX, localY);
+            if (i >= 0 && i !== this._menu.selected) {
                 this._menu.select(i);
                 this._queueRepaint();
             }
         }
-        return Clutter.EVENT_PROPAGATE;
+
+        // Primary-button click = rising edge of BUTTON1 in the modifier mask.
+        const down = (mods & Clutter.ModifierType.BUTTON1_MASK) !== 0;
+        if (down && !this._btnDown)
+            this._onPointerClick(localX, localY);
+        this._btnDown = down;
     }
 
-    _onButtonPress(ev) {
+    _onPointerClick(localX, localY) {
         if (!this._menu || this._info)
-            return Clutter.EVENT_PROPAGATE;
-        const [x, y] = this._localCoords(ev);
+            return;
         const [w, h] = this._area.get_surface_size();
-        const i = Render.menuHit(w, h, this._menu, x, y);
+        const i = Render.menuHit(w, h, this._menu, localX, localY);
         if (i >= 0) {
             this._menu.select(i);
             this._menu.activate();
         }
-        return Clutter.EVENT_STOP;
     }
 
     _keyToken(sym) {
