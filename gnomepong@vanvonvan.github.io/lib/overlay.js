@@ -39,6 +39,8 @@ export class PongOverlay {
         this._btnDown = false;      // last-frame primary-button state (edge detect)
         this._lastTime = 0;
         this._cursorHidden = false;
+        this._blurEffect = null;    // Shell.BlurEffect on _area while a menu is up
+        this._blurOn = false;
         this._colors = this._readColors();
         this._colorsId = this._settings.connect('changed', () => {
             this._colors = this._readColors();
@@ -124,6 +126,12 @@ export class PongOverlay {
             this._container.destroy();
             this._container = null;
         }
+        // The effect belonged to the now-destroyed _area; drop our refs so a
+        // re-open builds a fresh one.
+        this._blurEffect = null;
+        this._blurOn = false;
+        this._area = null;
+        this._overlayArea = null;
         this._menu = null;
         this._info = null;
         this._joinBox = null;
@@ -153,9 +161,16 @@ export class PongOverlay {
         this._container.set_position(m.x, m.y);
         this._container.set_size(m.width, m.height);
 
+        // The court is drawn on its own actor so a blur effect can be applied to
+        // ONLY the playfield while a menu/info screen is up (see _setBlur); the
+        // menu/info is drawn on a sibling actor stacked on top so it stays crisp.
         this._area = new St.DrawingArea({ x_expand: true, y_expand: true });
-        this._area.connect('repaint', () => this._repaint());
+        this._area.connect('repaint', () => this._repaintGame());
         this._container.add_child(this._area);
+
+        this._overlayArea = new St.DrawingArea({ x_expand: true, y_expand: true });
+        this._overlayArea.connect('repaint', () => this._repaintOverlay());
+        this._container.add_child(this._overlayArea);
 
         this._container.add_child(this._buildJoinForm());
 
@@ -459,6 +474,7 @@ export class PongOverlay {
     // the controls legend lives on the main menu (see _buildMenus). Kept under
     // the old name because it's called from every state transition.
     _syncHint() {
+        this._updateBlur();
         this._queueRepaint();
     }
 
@@ -577,22 +593,46 @@ export class PongOverlay {
             return;
         // GNOME 49+ dropped set_pointer_visible(); use the balanced inhibit API.
         // The state guard above keeps inhibit/uninhibit calls paired.
+        //
+        // CRUCIAL: pair the cursor-visibility inhibit with a seat *unfocus*
+        // inhibit, exactly as GNOME Shell's own magnifier (and the sibling
+        // GnomeShot aim-trainer) does. Without the unfocus inhibit the
+        // compositor slips the hardware cursor back the instant the pointer
+        // moves — which for a mouse-driven paddle is precisely when you're
+        // playing, so the cursor was showing over the game the whole time.
         const tracker = this._cursorTracker();
-        if (tracker && tracker.inhibit_cursor_visibility) {
-            if (hidden)
-                tracker.inhibit_cursor_visibility();
-            else
-                tracker.uninhibit_cursor_visibility();
+        if (!tracker || !tracker.inhibit_cursor_visibility) {
+            this._cursorHidden = hidden; // API absent (Shell < 49): nothing to do
+            return;
+        }
+        let seat = null;
+        try {
+            seat = Clutter.get_default_backend().get_default_seat();
+        } catch (_e) {
+            seat = null;
+        }
+        if (hidden) {
+            seat?.inhibit_unfocus();
+            tracker.inhibit_cursor_visibility();
+        } else {
+            tracker.uninhibit_cursor_visibility();
+            seat?.uninhibit_unfocus();
         }
         this._cursorHidden = hidden;
     }
 
     // ---- Rendering -------------------------------------------------------
 
-    _repaint() {
+    _repaintGame() {
         const cr = this._area.get_context();
         const [w, h] = this._area.get_surface_size();
         Render.draw(cr, w, h, this._view(), this._colors);
+        cr.$dispose();
+    }
+
+    _repaintOverlay() {
+        const cr = this._overlayArea.get_context();
+        const [w, h] = this._overlayArea.get_surface_size();
         if (this._info)
             Render.drawInfo(cr, w, h, this._info, this._colors);
         else if (this._menu)
@@ -604,6 +644,53 @@ export class PongOverlay {
     _queueRepaint() {
         if (this._area)
             this._area.queue_repaint();
+        if (this._overlayArea)
+            this._overlayArea.queue_repaint();
+    }
+
+    // Blur the court (only) whenever a menu / info / join screen is showing, so
+    // the playfield reads as a soft backdrop instead of a distracting live
+    // scene. Actor-mode Shell.BlurEffect blurs this actor's own painted content;
+    // the menu is on a sibling actor above, so it stays crisp. GnomePong has no
+    // bake/undo pipeline (unlike Kapodopera), so the actor-based effect is a
+    // clean fit here.
+    _makeBlur() {
+        try {
+            return new Shell.BlurEffect({
+                radius: 24,
+                brightness: 0.55, // also darkens the court so menu text reads well
+                mode: Shell.BlurMode.ACTOR,
+            });
+        } catch (_e) {
+            // Older Shell builds took `sigma` instead of `radius`.
+            try {
+                return new Shell.BlurEffect({
+                    sigma: 12,
+                    brightness: 0.55,
+                    mode: Shell.BlurMode.ACTOR,
+                });
+            } catch (_e2) {
+                return null; // no blur available; court just shows unblurred
+            }
+        }
+    }
+
+    _updateBlur() {
+        this._setBlur(!!(this._menu || this._info || this._joinVisible()));
+    }
+
+    _setBlur(on) {
+        if (on === this._blurOn || !this._area)
+            return;
+        this._blurOn = on;
+        if (on) {
+            if (!this._blurEffect)
+                this._blurEffect = this._makeBlur();
+            if (this._blurEffect)
+                this._area.add_effect(this._blurEffect);
+        } else if (this._blurEffect) {
+            this._area.remove_effect(this._blurEffect);
+        }
     }
 
     // ---- Input handlers --------------------------------------------------
