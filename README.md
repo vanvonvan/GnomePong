@@ -31,7 +31,7 @@
 
 - 🕹️ **1 Player vs AI** — you control the left paddle with the **mouse** against a balanced computer opponent.
 - 👥 **2 Players (local)** — left paddle **W/S**, right paddle **↑/↓**, on one keyboard.
-- 🌐 **Direct-connect multiplayer** — one player **hosts** on a port, the other **joins** by `IP:port` with a shared secret. Host-authoritative, JSON-over-TCP over Gio sockets, **no relay server**. Works on a LAN (host's LAN IP) or over the internet (a forwarded / public port) — same code path.
+- 🌐 **Direct-connect multiplayer** — one player **hosts** on a port, the other **joins** by `IP:port` with a shared secret. Host-authoritative, JSON-over-UDP over Gio sockets, **no relay server**. Works on a LAN (host's LAN IP) or over the internet (a forwarded / public port) — same code path.
 - 🔊 **Classic blips** — square-wave sounds for paddle hits, wall bounces, and points (toggleable).
 - 🏁 **First to 11**, configurable to **5 / 11 / 21**.
 - 🎨 **Recolor everything** — background, net/walls, ball, each paddle, and the score, from Preferences. Choices persist via **GSettings**.
@@ -130,7 +130,7 @@ gnomepong@vanvonvan.github.io/   the installable extension (this dir is what shi
   lib/menu.js         canvas menu model (main/pause/game-over)
   lib/overlay.js      full-screen overlay: actors, input, frame loop, net UI
   lib/sound.js        blip playback via the shell sound player
-  lib/net.js          direct-connect TCP host/client (JSON over Gio sockets)
+  lib/net.js          direct-connect UDP host/client (JSON over Gio sockets)
   lib/netgame.js      host-authoritative netplay over net.js + engine
   schemas/            GSettings schema
   sounds/             generated WAV blips (see tools/gen_sounds.py)

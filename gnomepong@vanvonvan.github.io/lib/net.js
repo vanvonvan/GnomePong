@@ -1,13 +1,27 @@
 // Direct-connect networking for GnomePong. Host-authoritative: one player
-// hosts (listens on a port), the other joins by IP:port. LAN uses the LAN IP;
+// hosts (binds a UDP port), the other joins by IP:port. LAN uses the LAN IP;
 // internet uses a forwarded port / public IP — identical code path.
 //
-// Wire format: newline-delimited JSON, one message per line (JSON never
-// contains a raw newline). Only Gio/GLib are used here so this module can be
-// exercised headlessly with plain `gjs`.
+// Transport: UDP datagrams, one JSON object per datagram (no stream framing —
+// each datagram already IS one message). Only Gio/GLib are used here so this
+// module can be exercised headlessly with plain `gjs`.
 //
-// NOTE: the connection is plain TCP — the shared secret is sent in clear text.
-// It gates uninvited joins; it is not cryptographic security.
+// Why UDP: the gameplay traffic suits it. The host broadcasts a FULL state
+// snapshot every tick, so a dropped/reordered packet is self-healing — the next
+// tick overwrites everything. Client input is last-value-wins, likewise
+// loss-tolerant. UDP also avoids TCP head-of-line blocking, where one lost
+// packet would stall every newer snapshot behind it.
+//
+// What UDP does NOT give us for free, and we add here:
+//   * Reliable handshake — the client resends `hello` on a timer until it gets
+//     a `welcome`/`reject`; the host re-acks a repeated `hello` idempotently.
+//   * Disconnect detection — TCP surfaced a closed socket; UDP has no such
+//     signal, so each side declares the peer gone after LIVENESS_MS of silence.
+//     During play the tick-rate state/input traffic keeps the link "warm".
+//
+// NOTE: the secret is sent in clear text — it gates uninvited joins, it is not
+// cryptographic security. UDP additionally makes source-spoofing easy, so this
+// remains strictly a "keep randoms out", not an authentication, mechanism.
 
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
@@ -15,6 +29,54 @@ import GLib from 'gi://GLib';
 export const DEFAULT_PORT = 7777;
 
 const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+
+// Handshake / liveness tuning (all milliseconds).
+const HELLO_INTERVAL_MS = 250;   // client re-sends `hello` this often until acked
+const CONNECT_TIMEOUT_MS = 6000; // client gives up if no welcome/reject by now
+const LIVENESS_CHECK_MS = 1000;  // how often each side checks for peer silence
+const LIVENESS_MS = 4000;        // no datagram for this long => peer is gone
+
+const encode = (obj) => encoder.encode(JSON.stringify(obj));
+
+// Monotonic "now" in milliseconds. Immune to wall-clock jumps.
+function nowMs() {
+    return GLib.get_monotonic_time() / 1000;
+}
+
+// A stable string key for a UDP source address, so we can tell "same client"
+// from "someone else" across datagrams.
+function addrKey(a) {
+    try {
+        return `${a.get_address().to_string()}:${a.get_port()}`;
+    } catch (_e) {
+        return null;
+    }
+}
+
+function makeUdpSocket() {
+    const s = new Gio.Socket({
+        family: Gio.SocketFamily.IPV4,
+        type: Gio.SocketType.DATAGRAM,
+        protocol: Gio.SocketProtocol.UDP,
+    });
+    s.init(null);
+    s.set_blocking(false);
+    return s;
+}
+
+// Resolve "host" (literal IPv4/IPv6 or a name) + port to a GSocketAddress.
+function resolveAddress(host, port) {
+    const literal = Gio.InetAddress.new_from_string(host);
+    if (literal)
+        return Gio.InetSocketAddress.new(literal, port);
+    // Names are rare for direct-connect LAN play; a short blocking lookup is
+    // acceptable here (the join UI is already a modal "Connecting…" screen).
+    const list = Gio.Resolver.get_default().lookup_by_name(host, null);
+    if (!list || list.length === 0)
+        throw new Error(`cannot resolve ${host}`);
+    return Gio.InetSocketAddress.new(list[0], port);
+}
 
 // Best-effort LAN IP the host can share. Opens a UDP socket "toward" a public
 // address (no packets sent) and reads back which local interface would be
@@ -48,208 +110,199 @@ export function parseAddress(text) {
     return { host, port: Number.isFinite(port) && port > 0 ? port : DEFAULT_PORT };
 }
 
-// Wraps one accepted/established connection: ordered async writes + a
-// line-reader loop. `handlers` = { message(obj), closed(reason), error(e) }.
-class Peer {
-    constructor(connection, cancellable, handlers) {
-        this._conn = connection;
+// Owns one bound UDP socket: an async readable-source that drains datagrams and
+// hands each parsed JSON object to `onDatagram(obj, srcAddress)`, plus a
+// fire-and-forget `send(obj, address)`. Shared by NetHost and NetClient.
+class UdpChannel {
+    constructor(socket, cancellable, onDatagram) {
+        this._socket = socket;
         this._cancellable = cancellable;
-        this._handlers = handlers;
-        this._out = connection.get_output_stream();
-        this._in = new Gio.DataInputStream({
-            base_stream: connection.get_input_stream(),
-            close_base_stream: true,
-        });
-        this._in.set_newline_type(Gio.DataStreamNewlineType.LF);
-        this._queue = [];
-        this._writing = false;
+        this._onDatagram = onDatagram;
         this._closed = false;
-        this._readLoop();
+        this._source = socket.create_source(GLib.IOCondition.IN, cancellable);
+        this._source.set_callback(() => this._onReadable());
+        this._source.attach(null);
     }
 
-    send(obj) {
+    _onReadable() {
         if (this._closed)
-            return;
-        this._queue.push(encoder.encode(`${JSON.stringify(obj)}\n`));
-        this._flush();
-    }
-
-    _flush() {
-        if (this._writing || this._closed || this._queue.length === 0)
-            return;
-        this._writing = true;
-        const bytes = new GLib.Bytes(this._queue.shift());
-        this._out.write_bytes_async(bytes, GLib.PRIORITY_DEFAULT, this._cancellable, (s, res) => {
+            return GLib.SOURCE_REMOVE;
+        // Drain every datagram currently queued; the socket is non-blocking, so
+        // an empty queue surfaces as WOULD_BLOCK and ends the loop.
+        for (;;) {
+            let bytes, from;
             try {
-                const n = s.write_bytes_finish(res);
-                if (n < bytes.get_size()) {
-                    // Rare partial write — requeue the tail.
-                    const rest = bytes.get_data().slice(n);
-                    this._queue.unshift(rest);
-                }
-                this._writing = false;
-                this._flush();
+                [bytes, from] = this._socket.receive_bytes_from(65536, 0, this._cancellable);
             } catch (e) {
-                this._fail(e);
+                if (e?.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.WOULD_BLOCK))
+                    return GLib.SOURCE_CONTINUE;
+                if (e?.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+                    return GLib.SOURCE_REMOVE;
+                // Transient (e.g. ICMP port-unreachable surfaced as an error on
+                // a prior send): ignore and keep listening.
+                return GLib.SOURCE_CONTINUE;
             }
-        });
-    }
-
-    _readLoop() {
-        this._in.read_line_async(GLib.PRIORITY_DEFAULT, this._cancellable, (stream, res) => {
-            let line;
-            try {
-                [line] = stream.read_line_finish_utf8(res);
-            } catch (e) {
-                this._fail(e);
-                return;
-            }
-            if (line === null) {
-                this.close('peer closed the connection');
-                return;
-            }
-            if (line.length > 0) {
+            const data = bytes.get_data();
+            if (data && data.length > 0) {
                 let obj = null;
                 try {
-                    obj = JSON.parse(line);
+                    obj = JSON.parse(decoder.decode(data));
                 } catch (_e) {
-                    // Ignore malformed frames rather than dropping the link.
+                    // Ignore malformed datagrams rather than dropping the link.
                 }
-                if (obj && this._handlers.message)
-                    this._handlers.message(obj);
+                if (obj)
+                    this._onDatagram(obj, from);
             }
-            if (!this._closed)
-                this._readLoop();
-        });
-    }
-
-    _fail(e) {
-        if (this._closed)
-            return;
-        if (e && e.matches && e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED)) {
-            this.close('cancelled');
-            return;
+            // A handler may have closed us (reject / bye / stop).
+            if (this._closed)
+                return GLib.SOURCE_REMOVE;
         }
-        if (this._handlers.error)
-            this._handlers.error(e);
-        this.close(e && e.message ? e.message : 'connection error');
     }
 
-    close(reason) {
+    send(obj, address) {
+        if (this._closed || !address)
+            return;
+        try {
+            this._socket.send_to(address, encode(obj), this._cancellable);
+        } catch (_e) {
+            // UDP sends are best-effort; a later datagram may still get through.
+        }
+    }
+
+    close() {
         if (this._closed)
             return;
         this._closed = true;
-        try {
-            this._conn.close(null);
-        } catch (_e) {
-            // ignore
+        if (this._source) {
+            this._source.destroy();
+            this._source = null;
         }
-        if (this._handlers.closed)
-            this._handlers.closed(reason);
+        try { this._socket.close(); } catch (_e) {}
     }
 }
 
-// Host: listens, accepts a single client, validates the secret, then relays
-// game messages. handlers: { connected(), input(y), closed(reason), error(e) }
+// Host: binds a port, accepts a single client (validated by secret), then
+// relays game messages. handlers: { connected(), input(y), closed(reason), error(e) }
 export class NetHost {
     constructor({ port = DEFAULT_PORT, secret = '', handlers = {} }) {
         this._port = port;
         this._secret = String(secret);
         this._handlers = handlers;
         this._cancellable = new Gio.Cancellable();
-        this._service = null;
-        this._peer = null;
-        this._ready = false; // secret accepted?
+        this._channel = null;
+        this._clientAddr = null;   // GSocketAddress of the joined client
+        this._clientKey = null;    // addrKey(clientAddr)
+        this._ready = false;       // secret accepted?
+        this._lastRecv = 0;
+        this._livenessId = 0;
     }
 
-    // Begins listening. Throws (GLib.Error) if the port is unavailable.
-    // A port of 0 picks any free port (handy for tests); the chosen port is
-    // returned either way.
+    // Binds the port. Throws (GLib.Error) if it's unavailable. A port of 0 picks
+    // any free port (handy for tests); the chosen port is returned either way.
     start() {
-        this._service = new Gio.SocketService();
-        if (this._port && this._port > 0)
-            this._service.add_inet_port(this._port, null);
-        else
-            this._port = this._service.add_any_inet_port(null);
-        this._service.connect('incoming', (_service, connection) => {
-            this._onIncoming(connection);
-            return true; // handled
-        });
-        this._service.start();
+        const socket = makeUdpSocket();
+        const bindPort = this._port && this._port > 0 ? this._port : 0;
+        socket.bind(Gio.InetSocketAddress.new_from_string('0.0.0.0', bindPort), true);
+        this._port = socket.get_local_address().get_port();
+        this._channel = new UdpChannel(socket, this._cancellable,
+            (obj, from) => this._onDatagram(obj, from));
         return this._port;
     }
 
-    _onIncoming(connection) {
-        if (this._peer) {
-            // Already have a player — refuse extras.
-            try { connection.close(null); } catch (_e) {}
-            return;
-        }
-        this._peer = new Peer(connection, this._cancellable, {
-            message: (msg) => this._onMessage(msg),
-            closed: (reason) => this._onClosed(reason),
-            error: (e) => this._handlers.error?.(e),
-        });
-    }
+    _onDatagram(msg, from) {
+        const key = addrKey(from);
 
-    _onMessage(msg) {
         if (!this._ready) {
             if (msg.t === 'hello') {
                 if (msg.secret === this._secret) {
+                    this._clientAddr = from;
+                    this._clientKey = key;
                     this._ready = true;
-                    this._peer.send({ t: 'welcome', side: 'right' });
+                    this._lastRecv = nowMs();
+                    this._channel.send({ t: 'welcome', side: 'right' }, from);
+                    this._startLiveness();
                     this._handlers.connected?.();
                 } else {
-                    this._peer.send({ t: 'reject', reason: 'Wrong secret' });
-                    // Give the reject a moment to flush, then drop.
-                    this._rejectAndDrop();
+                    this._channel.send({ t: 'reject', reason: 'Wrong secret' }, from);
                 }
             }
             return;
         }
-        if (msg.t === 'input' && typeof msg.y === 'number')
+
+        // We already have a player. A hello from a *different* address is a
+        // second would-be joiner — refuse it; one game at a time.
+        if (key !== this._clientKey) {
+            if (msg.t === 'hello')
+                this._channel.send({ t: 'reject', reason: 'Host busy' }, from);
+            return;
+        }
+
+        this._lastRecv = nowMs();
+        if (msg.t === 'hello') {
+            // Retransmitted hello (our welcome was lost). Re-ack idempotently.
+            if (msg.secret === this._secret)
+                this._channel.send({ t: 'welcome', side: 'right' }, from);
+        } else if (msg.t === 'input' && typeof msg.y === 'number') {
             this._handlers.input?.(msg.y);
-        else if (msg.t === 'bye')
-            this._peer?.close('peer left');
+        } else if (msg.t === 'bye') {
+            this._onClosed('peer left');
+        }
     }
 
-    _rejectAndDrop() {
-        const peer = this._peer;
-        this._peer = null;
-        GLib.timeout_add(GLib.PRIORITY_DEFAULT, 150, () => {
-            peer?.close('rejected');
-            return GLib.SOURCE_REMOVE;
+    _startLiveness() {
+        if (this._livenessId)
+            return;
+        this._livenessId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, LIVENESS_CHECK_MS, () => {
+            if (this._ready && nowMs() - this._lastRecv > LIVENESS_MS) {
+                this._onClosed('peer timed out');
+                return GLib.SOURCE_REMOVE;
+            }
+            return GLib.SOURCE_CONTINUE;
         });
     }
 
+    _stopLiveness() {
+        if (this._livenessId) {
+            GLib.source_remove(this._livenessId);
+            this._livenessId = 0;
+        }
+    }
+
+    // Drop the current client but keep the socket bound so a new one can join
+    // (mirrors the old TCP listener staying up after a peer disconnected).
     _onClosed(reason) {
-        this._peer = null;
+        const wasReady = this._ready;
         this._ready = false;
-        this._handlers.closed?.(reason);
+        this._clientAddr = null;
+        this._clientKey = null;
+        this._stopLiveness();
+        if (wasReady)
+            this._handlers.closed?.(reason);
     }
 
     sendState(state) {
-        if (this._ready && this._peer)
-            this._peer.send({ t: 'state', ...state });
+        if (this._ready && this._clientAddr)
+            this._channel.send({ t: 'state', ...state }, this._clientAddr);
     }
 
     stop() {
+        this._stopLiveness();
+        // Best-effort goodbye before we cancel (send_to fails once cancelled).
+        if (this._ready && this._clientAddr)
+            this._channel?.send({ t: 'bye' }, this._clientAddr);
         this._cancellable.cancel();
-        if (this._peer) {
-            try { this._peer.send({ t: 'bye' }); } catch (_e) {}
-            this._peer.close('host stopped');
-            this._peer = null;
+        if (this._channel) {
+            this._channel.close();
+            this._channel = null;
         }
-        if (this._service) {
-            this._service.stop();
-            this._service.close();
-            this._service = null;
-        }
+        this._clientAddr = null;
+        this._clientKey = null;
+        this._ready = false;
     }
 }
 
-// Client: connects, sends the secret, then streams input and receives state.
-// handlers: { welcome(side), state(obj), rejected(reason), closed(reason), error(e) }
+// Client: resends the secret until welcomed/rejected, then streams input and
+// receives state. handlers: { welcome(side), state(obj), rejected(reason), closed(reason), error(e) }
 export class NetClient {
     constructor({ host, port = DEFAULT_PORT, secret = '', handlers = {} }) {
         this._host = host;
@@ -257,60 +310,138 @@ export class NetClient {
         this._secret = String(secret);
         this._handlers = handlers;
         this._cancellable = new Gio.Cancellable();
-        this._peer = null;
+        this._channel = null;
+        this._serverAddr = null;
         this._welcomed = false;
+        this._done = false;         // welcomed | rejected | failed — stop hello resends
+        this._closedFired = false;
+        this._helloId = 0;
+        this._deadlineId = 0;
+        this._lastRecv = 0;
+        this._livenessId = 0;
     }
 
     connect() {
-        const client = new Gio.SocketClient();
-        client.connect_to_host_async(this._host, this._port, this._cancellable, (c, res) => {
-            let connection;
-            try {
-                connection = c.connect_to_host_finish(res);
-            } catch (e) {
-                this._handlers.error?.(e);
-                this._handlers.closed?.(e && e.message ? e.message : 'could not connect');
-                return;
-            }
-            this._peer = new Peer(connection, this._cancellable, {
-                message: (msg) => this._onMessage(msg),
-                closed: (reason) => this._handlers.closed?.(reason),
-                error: (e) => this._handlers.error?.(e),
-            });
-            this._peer.send({ t: 'hello', secret: this._secret });
+        let socket;
+        try {
+            socket = makeUdpSocket();
+            this._serverAddr = resolveAddress(this._host, this._port);
+        } catch (e) {
+            this._handlers.error?.(e);
+            this._handlers.closed?.(e?.message || 'could not connect');
+            return;
+        }
+        this._channel = new UdpChannel(socket, this._cancellable,
+            (obj) => this._onDatagram(obj));
+
+        // Fire the first hello now, then resend until welcomed/rejected. UDP has
+        // no connect handshake, so this IS how we reach the host reliably.
+        this._sendHello();
+        this._helloId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, HELLO_INTERVAL_MS, () => {
+            if (this._done)
+                return GLib.SOURCE_REMOVE;
+            this._sendHello();
+            return GLib.SOURCE_CONTINUE;
+        });
+        this._deadlineId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, CONNECT_TIMEOUT_MS, () => {
+            this._deadlineId = 0;
+            if (!this._welcomed && !this._done)
+                this._onClosed('no response from host');
+            return GLib.SOURCE_REMOVE;
         });
     }
 
-    _onMessage(msg) {
+    get welcomed() { return this._welcomed; }
+
+    _sendHello() {
+        this._channel?.send({ t: 'hello', secret: this._secret }, this._serverAddr);
+    }
+
+    _onDatagram(msg) {
+        this._lastRecv = nowMs();
         switch (msg.t) {
             case 'welcome':
-                this._welcomed = true;
-                this._handlers.welcome?.(msg.side || 'right');
+                if (!this._welcomed && !this._done) {
+                    this._welcomed = true;
+                    this._done = true;
+                    this._stopHello();
+                    this._startLiveness();
+                    this._handlers.welcome?.(msg.side || 'right');
+                }
                 break;
             case 'reject':
-                this._handlers.rejected?.(msg.reason || 'rejected');
-                this._peer?.close(msg.reason || 'rejected');
+                if (!this._done) {
+                    this._done = true;
+                    this._stopHello();
+                    this._handlers.rejected?.(msg.reason || 'rejected');
+                    this.stop();
+                }
                 break;
             case 'state':
                 this._handlers.state?.(msg);
                 break;
             case 'bye':
-                this._peer?.close('host left');
+                this._onClosed('host left');
                 break;
         }
     }
 
+    _startLiveness() {
+        this._lastRecv = nowMs();
+        if (this._livenessId)
+            return;
+        this._livenessId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, LIVENESS_CHECK_MS, () => {
+            if (this._welcomed && nowMs() - this._lastRecv > LIVENESS_MS) {
+                this._onClosed('host timed out');
+                return GLib.SOURCE_REMOVE;
+            }
+            return GLib.SOURCE_CONTINUE;
+        });
+    }
+
+    _stopHello() {
+        if (this._helloId) {
+            GLib.source_remove(this._helloId);
+            this._helloId = 0;
+        }
+        if (this._deadlineId) {
+            GLib.source_remove(this._deadlineId);
+            this._deadlineId = 0;
+        }
+    }
+
+    _stopLiveness() {
+        if (this._livenessId) {
+            GLib.source_remove(this._livenessId);
+            this._livenessId = 0;
+        }
+    }
+
+    _onClosed(reason) {
+        if (this._closedFired)
+            return;
+        this._closedFired = true;
+        this._done = true;
+        this._stopHello();
+        this._stopLiveness();
+        this._handlers.closed?.(reason);
+    }
+
     sendInput(y) {
-        if (this._welcomed && this._peer)
-            this._peer.send({ t: 'input', y });
+        if (this._welcomed && this._channel)
+            this._channel.send({ t: 'input', y }, this._serverAddr);
     }
 
     stop() {
+        this._done = true;
+        this._stopHello();
+        this._stopLiveness();
+        if (this._welcomed && this._channel && this._serverAddr)
+            this._channel.send({ t: 'bye' }, this._serverAddr);
         this._cancellable.cancel();
-        if (this._peer) {
-            try { this._peer.send({ t: 'bye' }); } catch (_e) {}
-            this._peer.close('client stopped');
-            this._peer = null;
+        if (this._channel) {
+            this._channel.close();
+            this._channel = null;
         }
     }
 }
