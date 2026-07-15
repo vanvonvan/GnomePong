@@ -212,10 +212,18 @@ export class PongOverlay {
     _buildJoinForm() {
         this._joinBox = new St.BoxLayout({
             style_class: 'gnomepong-joinform',
-            orientation: Clutter.Orientation.VERTICAL,
             x_align: Clutter.ActorAlign.CENTER,
             y_align: Clutter.ActorAlign.CENTER,
         });
+        // Make it vertical in a version-proof way. The `orientation` enum
+        // property was added in GNOME 48; the `vertical` boolean exists on
+        // 46/47 and, deprecated, through 50. Passing the wrong one to the
+        // constructor is a hard error in GJS (unknown construct property
+        // throws), so set whichever this shell actually exposes.
+        if ('orientation' in this._joinBox)
+            this._joinBox.orientation = Clutter.Orientation.VERTICAL;
+        else
+            this._joinBox.vertical = true;
 
         this._joinBox.add_child(new St.Label({
             style_class: 'gnomepong-join-title', text: 'Join game',
@@ -601,8 +609,18 @@ export class PongOverlay {
         // moves — which for a mouse-driven paddle is precisely when you're
         // playing, so the cursor was showing over the game the whole time.
         const tracker = this._cursorTracker();
-        if (!tracker || !tracker.inhibit_cursor_visibility) {
-            this._cursorHidden = hidden; // API absent (Shell < 49): nothing to do
+        if (!tracker) {
+            this._cursorHidden = hidden; // no tracker at all: nothing to do
+            return;
+        }
+        // Older shells (through ~48) expose the direct set_pointer_visible()
+        // toggle that 49+ dropped in favour of the balanced inhibit API. Prefer
+        // the inhibit API when present; fall back to the toggle so the cursor
+        // still hides during play on GNOME 46/47/48.
+        if (!tracker.inhibit_cursor_visibility) {
+            if (tracker.set_pointer_visible)
+                tracker.set_pointer_visible(!hidden);
+            this._cursorHidden = hidden;
             return;
         }
         let seat = null;

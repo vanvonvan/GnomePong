@@ -2,7 +2,7 @@
   "uuid": "gnomepong@vanvonvan.github.io",
   "name": "GnomePong",
   "description": "Classic Pong, right on your GNOME desktop. Single-player vs a balanced AI, two-player on one keyboard, and direct-connect LAN/internet multiplayer. Fully recolorable.",
-  "shell-version": ["50"],
+  "shell-version": ["46", "47", "48", "49", "50"],
   "settings-schema": "org.gnome.shell.extensions.gnomepong",
   "gettext-domain": "gnomepong",
   "url": "https://github.com/vanvonvan/GnomePong",
