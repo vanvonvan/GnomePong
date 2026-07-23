@@ -14,9 +14,11 @@ export class SoundPlayer {
             wall: f('wall.wav'),
             score: f('score.wav'),
         };
-        // MetaSoundPlayer, shared with the rest of the shell.
+        // MetaSoundPlayer, shared with the rest of the shell. The method is
+        // get_sound_player() (get_sound() does not exist on Meta.Display and
+        // would silently null the player, killing all audio).
         try {
-            this._player = global.display.get_sound();
+            this._player = global.display.get_sound_player();
         } catch (_e) {
             this._player = null;
         }
